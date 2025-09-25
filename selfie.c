@@ -1274,6 +1274,15 @@ void     implement_read(uint64_t* context);
 void emit_write();
 void implement_write(uint64_t* context);
 
+void emit_dummy_syscall();
+void implement_dummy_syscall(uint64_t* context);
+
+void emit_fork();
+void implement_fork(uint64_t* context);
+
+void emit_getppid();
+void implement_getppid(uint64_t* context);
+
 void     emit_open();
 uint64_t down_load_string(uint64_t* context, uint64_t vstring, char* s);
 void     implement_openat(uint64_t* context);
@@ -1296,6 +1305,10 @@ uint64_t SYSCALL_READ   = 63;
 uint64_t SYSCALL_WRITE  = 64;
 uint64_t SYSCALL_OPENAT = 56;
 uint64_t SYSCALL_BRK    = 214;
+uint64_t SYSCALL_DUMMY_SYSCALL = 1;
+
+uint64_t SYSCALL_FORK = 220;
+uint64_t SYSCALL_GETPPID = 221;
 
 /* DIRFD_AT_FDCWD corresponds to AT_FDCWD in fcntl.h and
    is passed as first argument of the openat system call
@@ -2503,6 +2516,8 @@ void init_selfie(uint64_t argc, uint64_t* argv) {
   selfie_argv = argv;
 
   selfie_name = get_argument();
+  
+  printf("%s: This is Angel Tito's Selfie!\n", selfie_name);
 }
 
 void init_system() {
@@ -6308,6 +6323,9 @@ void selfie_compile() {
   emit_read();
   emit_write();
   emit_open();
+  emit_dummy_syscall();
+  emit_fork();
+  emit_getppid();
 
   emit_malloc();
 
@@ -7827,6 +7845,69 @@ void implement_read(uint64_t* context) {
     printf(" -> ");
     print_register_value(REG_A0);
     println();
+  }
+}
+
+void emit_dummy_syscall() {
+  create_symbol_table_entry(GLOBAL_TABLE, string_copy("dummy_syscall"),0, PROCEDURE, UINT64_T, 1, code_size);
+
+  emit_load(REG_A0, REG_SP, 0);  //input
+  emit_addi(REG_SP, REG_SP, WORDSIZE);
+
+  emit_addi(REG_A7, REG_ZR, SYSCALL_DUMMY_SYSCALL);
+
+  emit_ecall();
+
+  emit_jalr(REG_ZR, REG_RA, 0);
+
+}
+
+void implement_dummy_syscall(uint64_t* context){
+  //context = input, es lo que se sumara al output}
+  uint64_t param;
+
+  param = *(get_regs(context) + REG_A0);
+  *(get_regs(context) + REG_A0) = param + 2025;
+  set_pc(context, get_pc(context) + INSTRUCTIONSIZE);
+}
+
+void emit_fork(){
+  create_symbol_table_entry(GLOBAL_TABLE, string_copy("fork"),0,PROCEDURE, UINT64_T, 0, code_size);
+  emit_addi(REG_A7, REG_ZR, SYSCALL_FORK);
+  emit_ecall();
+  emit_jalr(REG_ZR, REG_RA, 0);
+}
+
+void implement_fork(uint64_t* context){
+  uint64_t* child_context;
+  uint64_t parent_pid, child_pid;
+
+  if(debug_syscalls){
+    printf("(fork): creating new process\n");
+  }
+
+  child_context = create_child_context(context);
+
+  if (child_context == (uint64_t*) 0){ // error during creation
+    *(get_regs(context) + REG_A0) = -1; // return -1 to parent
+    set_pc(context, get_pc(context) + INSTRUCTIONSIZE);// advance pc
+    return;
+  }
+
+  copy_process_state(context, child_context); // copy registers and pc
+
+  parent_pid = get_process_id(context);
+  child_pid = get_process_id(child_context);
+
+  *(get_regs(context) + REG_A0) = child_pid; // return child's pid to parent
+
+  *(get_regs(child_context) + REG_A0) = 0;
+
+  set_pc(context, get_pc(context) + INSTRUCTIONSIZE); // advance pc of parent
+  set_pc(child_context, get_pc(child_context) + INSTRUCTIONSIZE); // advance pc of child
+
+  if(debug_syscalls){
+    printf(" -> parent gets %lu, child gets 0\n", child_pid);
   }
 }
 
@@ -9492,6 +9573,10 @@ void do_ecall() {
     }
   else {
     read_register(REG_A0);
+
+    if(a7 == SYSCALL_DUMMY_SYSCALL){
+      write_register(REG_A0);
+    }
 
     if (a7 != SYSCALL_EXIT) {
       if (a7 != SYSCALL_BRK) {
@@ -11242,6 +11327,85 @@ uint64_t* create_context(uint64_t* parent, uint64_t* vctxt) {
   return context;
 }
 
+uint64_t* create_child_context(uint64_t* parent) {
+  child = create_context(parent, 0);
+
+  if (child == (uint64_t*) 0)
+    return (uint64_t*) 0;
+
+  // Copiar la información básica del segmento de código y datos
+  set_code_seg_start(child, get_code_seg_start(parent));
+  set_code_seg_size(child, get_code_seg_size(parent));
+  set_data_seg_start(child, get_data_seg_start(parent));
+  set_data_seg_size(child, get_data_seg_size(parent));
+  set_heap_seg_start(child, get_heap_seg_start(parent));
+  set_program_break(child, get_program_break(parent));
+
+  char* child_name = string_alloc(MAX_FILENAME_LENGTH);
+  sprintf(child_name, "%s-child", get_name(parent));
+  set_name(child, child_name);
+
+  return child;
+}
+
+void copy_process_state(uint64_t* parent, uint64_t* child){
+  uint64_t i;
+  uint64_t* parent_regs;
+  uint64_t* child_regs;
+
+  parent_regs = get_regs(parent);
+  child_regs  = get_regs(child);
+
+  for (i = 0; i < NUMBEROFREGISTERS; i = i + 1)
+    *(child_regs + i) = *(parent_regs + i);
+
+  set_pc(child, get_pc(parent));
+  set_parent(child, parent);
+
+  copy_page_table_simple(parent, child);
+}
+
+void copy_page_table_simple(uint64_t* parent, uint64_t* child) {
+  uint64_t page;
+  uint64_t frame;
+  uint64_t* new_frame;
+  uint64_t vaddr;
+  uint64_t data;
+  
+  // Copiar solo las páginas mapeadas del heap y datos
+  page = get_lowest_lo_page(parent);
+  
+  while (page <= get_highest_lo_page(parent)) {
+    if (is_page_mapped(get_pt(parent), page)) {
+      // Allocar nueva página física para el hijo
+      new_frame = palloc();
+      
+      if (new_frame != (uint64_t*) 0) {
+        // Copiar contenido de la página
+        vaddr = virtual_address_of_page(page);
+        
+        // Copiar palabra por palabra
+        uint64_t offset = 0;
+        while (offset < PAGESIZE) {
+          if (is_virtual_address_mapped(get_pt(parent), vaddr + offset)) {
+            data = load_virtual_memory(get_pt(parent), vaddr + offset);
+            store_physical_memory((uint64_t*)((uint64_t)new_frame + offset), data);
+          }
+          offset += WORDSIZE;
+        }
+        
+        // Mapear la nueva página en el espacio del hijo
+        map_page(child, page, (uint64_t) new_frame);
+      }
+    }
+    page++;
+  }
+  
+  // Actualizar cache de páginas del hijo
+  set_lowest_lo_page(child, get_lowest_lo_page(parent));
+  set_highest_lo_page(child, get_highest_lo_page(parent));
+}
+
 uint64_t* find_context(uint64_t* parent, uint64_t* vctxt) {
   uint64_t* context;
 
@@ -11797,6 +11961,8 @@ uint64_t handle_system_call(uint64_t* context) {
     implement_write(context);
   else if (a7 == SYSCALL_OPENAT)
     implement_openat(context);
+  else if (a7 == SYSCALL_DUMMY_SYSCALL)
+    implement_dummy_syscall(context);
   else if (a7 == SYSCALL_EXIT) {
     implement_exit(context);
 
